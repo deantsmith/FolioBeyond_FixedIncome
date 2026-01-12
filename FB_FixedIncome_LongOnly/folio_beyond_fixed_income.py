@@ -1412,25 +1412,27 @@ print("✅ Performance analysis functions ready")
 # SECTION 6: HIGH-LEVEL WORKFLOW MANAGEMENT
 # =============================================================================
 
-def run_portfolio_strategy(strategy_name: str, 
+def run_portfolio_strategy(strategy_name: str,
                           max_windows: Optional[int] = None,
-                          debug_mode: bool = True) -> Dict[str, Any]:
+                          debug_mode: bool = True,
+                          enable_long_short: bool = False) -> Dict[str, Any]:
     """
     Complete workflow: Load data, optimize, analyze performance for a single strategy.
-    
+
     Args:
-        strategy_name: Name of strategy (e.g., "Moderate Int.20121101.current") 
+        strategy_name: Name of strategy (e.g., "Moderate Int.20121101.current")
         max_windows: Maximum number of optimization windows to process (for testing)
         debug_mode: If True, writes outputs to local debug folder
-    
+        enable_long_short: If True, enables long/short positions with leverage
+
     Returns:
         Dictionary with complete results
     """
     print(f"🚀 RUNNING PORTFOLIO STRATEGY: {strategy_name}")
     print("=" * 70)
-    
+
     # Create fresh portfolio instance
-    portfolio_instance = Portfolio(debug_mode=debug_mode)
+    portfolio_instance = Portfolio(debug_mode=debug_mode, enable_long_short=enable_long_short)
     
     try:
         # Step 1: Load all data
@@ -2101,6 +2103,60 @@ def demo_multiple_strategies():
     except Exception as e:
         print(f"\n❌ MULTIPLE STRATEGIES ERROR: {str(e)}")
 
+def demo_long_short_strategy():
+    """
+    Run a long/short strategy demo with leverage.
+    """
+    print("🚀 RUNNING LONG/SHORT STRATEGY DEMO")
+    print("=" * 50)
+    print("This will run optimization with short positions and leverage enabled.")
+    print("Expected runtime: 5-10 minutes")
+    print()
+
+    try:
+        result = run_portfolio_strategy(
+            strategy_name="Moderate Int.20121101.current",
+            max_windows=50,  # Reasonable size for demo
+            debug_mode=True,
+            enable_long_short=True  # Enable long/short mode
+        )
+
+        if result['success']:
+            print("\n🎉 LONG/SHORT STRATEGY DEMO SUCCESSFUL!")
+
+            # Generate and display performance report
+            perf_results = result.get('performance_results', {})
+            if perf_results:
+                print("\n📊 PERFORMANCE REPORT:")
+
+                perf_metrics = perf_results.get('performance_metrics', {})
+                if perf_metrics:
+                    print(f"\n📈 Returns:")
+                    print(f"   Annualized Return: {perf_metrics.get('annualized_return', 0):.2%}")
+                    print(f"   Sharpe Ratio: {perf_metrics.get('sharpe_ratio', 0):.2f}")
+                    print(f"   Max Drawdown: {perf_metrics.get('max_drawdown', 0):.2%}")
+
+                ls_metrics = perf_results.get('long_short_metrics', {})
+                if ls_metrics:
+                    print(f"\n📊 Long/Short Exposure:")
+                    print(f"   Avg Gross Exposure: {ls_metrics.get('avg_gross_exposure', 0):.2%}")
+                    print(f"   Avg Net Exposure: {ls_metrics.get('avg_net_exposure', 0):.2%}")
+                    print(f"   Avg Long Exposure: {ls_metrics.get('avg_long_exposure', 0):.2%}")
+                    print(f"   Avg Short Exposure: {ls_metrics.get('avg_short_exposure', 0):.2%}")
+                    print(f"   Avg Leverage Ratio: {ls_metrics.get('avg_leverage_ratio', 0):.2f}x")
+
+            # Show file outputs
+            export_results = result.get('export_results', {})
+            if export_results:
+                print(f"\n💾 Files created:")
+                for file_type, file_path in export_results.items():
+                    print(f"   {file_type}: {file_path}")
+        else:
+            print(f"\n❌ LONG/SHORT STRATEGY DEMO FAILED: {result.get('error')}")
+
+    except Exception as e:
+        print(f"\n❌ LONG/SHORT STRATEGY DEMO ERROR: {str(e)}")
+
 def show_system_summary():
     """
     Display a summary of the refactored system capabilities.
@@ -2109,15 +2165,15 @@ def show_system_summary():
     print("FOLIO BEYOND FIXED INCOME OPTIMIZATION SYSTEM - REFACTORED")
     print("=" * 70)
     
-    print("\n🎯 KEY IMPROVEMENTS MADE:")
-    print("  ✅ Added missing stress test constraints - Core functionality now complete")
-    print("  ✅ Removed dead code - Eliminated unused parameters and functions") 
-    print("  ✅ Standardized data types - Consistent DataFrame usage throughout")
-    print("  ✅ Clear separation of concerns - Configuration, data, optimization, analysis")
-    print("  ✅ Single entry points - Eliminated redundant functions")
-    print("  ✅ Configuration-driven - All parameters externalized")
-    print("  ✅ Improved error handling - Clear error messages and validation")
-    print("  ✅ Better documentation - Clear function purposes and workflows")
+    print("\n🎯 KEY FEATURES:")
+    print("  ✅ Mean-variance optimization with stress test constraints")
+    print("  ✅ Long-only AND long/short with leverage support")
+    print("  ✅ Multiple volatility targets (Low/Moderate/High/RRS)")
+    print("  ✅ Comprehensive risk analytics (VaR, CVaR, drawdown)")
+    print("  ✅ Standardized data types and clean architecture")
+    print("  ✅ Configuration-driven with all parameters externalized")
+    print("  ✅ Debug mode for safe testing")
+    print("  ✅ Modular design for easy extension")
     
     print("\n🚀 MAIN ENTRY POINTS:")
     print("  • run_quick_test() - Quick testing with limited data")
@@ -2126,18 +2182,23 @@ def show_system_summary():
     
     print("\n🧪 DEMO FUNCTIONS:")
     print("  • demo_quick_test() - 1-2 minute quick verification")
-    print("  • demo_full_strategy() - 5-15 minute full strategy demo") 
+    print("  • demo_full_strategy() - 5-15 minute full long-only strategy")
+    print("  • demo_long_short_strategy() - 5-10 minute long/short with leverage")
     print("  • demo_multiple_strategies() - Compare multiple strategies")
-    
-    print("\n⚙️ CONFIGURATION:")
+
+    print("\n⚙️ CONFIGURATION - LONG-ONLY:")
     print(f"  • Trading days per year: {config.TRADING_DAYS_PER_YEAR}")
     print(f"  • Lookback window: {config.LOOKBACK_WINDOW_DAYS} days")
     print(f"  • Max weight per asset: {config.MAX_WEIGHT_PER_ASSET:.1%}")
     print(f"  • Stress test max loss: {config.STRESS_TEST_MAX_LOSS}%")
-    
-    print("\n🔥 CRITICAL FIX:")
-    print("  Stress test constraints are now properly implemented in optimization!")
-    print("  Portfolio stress loss is constrained to <= 15% as required.")
+
+    print("\n⚙️ CONFIGURATION - LONG/SHORT:")
+    print(f"  • Max long weight: {ls_config.MAX_LONG_WEIGHT:.1%}")
+    print(f"  • Max short weight: {ls_config.MAX_SHORT_WEIGHT:.1%}")
+    print(f"  • Gross exposure limit: {ls_config.GROSS_EXPOSURE_LIMIT:.1%}")
+    print(f"  • Net exposure target: {ls_config.NET_EXPOSURE_TARGET:.1%}")
+    print(f"  • Leverage cost: {ls_config.LEVERAGE_COST_BPS/100:.2%} annual")
+    print(f"  • Borrow cost: {ls_config.BORROW_COST_BPS/100:.2%} annual")
     
     print("\n💾 OUTPUT:")
     print("  • All outputs written to debug folders by default (safe testing)")
@@ -2156,23 +2217,27 @@ if __name__ == "__main__":
     # Create portfolio instance in DEBUG mode by default for safety
     portfolio = Portfolio(debug_mode=True)
     print(f"📊 Portfolio summary: {portfolio.get_data_summary()}")
-    
+
     # Show system summary when file is executed
     show_system_summary()
-    
+
     print("\n🧪 READY TO TEST!")
     print("\nChoose your testing approach:")
-    print("1️⃣ Quick verification:    demo_quick_test()")
-    print("2️⃣ Full single strategy:  demo_full_strategy()")  
-    print("3️⃣ Multiple strategies:   demo_multiple_strategies()")
+    print("1️⃣ Quick verification:           demo_quick_test()")
+    print("2️⃣ Full long-only strategy:     demo_full_strategy()")
+    print("3️⃣ Long/short with leverage:    demo_long_short_strategy()")
+    print("4️⃣ Multiple strategies:          demo_multiple_strategies()")
     print("\nOr use the main functions directly:")
     print("🎯 run_quick_test()")
-    print("🚀 run_portfolio_strategy('Moderate Int.20121101.current')")
-    print("📊 run_multiple_strategies(['strategy1', 'strategy2'])")
-    
-    # Uncomment the line below to run a quick demo automatically:
-    #demo_quick_test()
-    demo_full_strategy()
+    print("🚀 run_portfolio_strategy('Moderate Int.20121101.current', enable_long_short=False)")
+    print("📊 run_portfolio_strategy('Moderate Int.20121101.current', enable_long_short=True)")
+    print("📈 run_multiple_strategies(['strategy1', 'strategy2'])")
+
+    # Uncomment one of the lines below to run a demo automatically:
+    # demo_quick_test()
+    # demo_full_strategy()
+    # demo_long_short_strategy()
+    pass
     
 
 
