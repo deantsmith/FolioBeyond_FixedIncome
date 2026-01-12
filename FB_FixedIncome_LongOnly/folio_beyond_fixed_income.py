@@ -103,10 +103,74 @@ class Config:
 # Create global config instance
 config = Config()
 
+# =============================================================================
+# LONG/SHORT CONFIGURATION CLASS
+# =============================================================================
+
+class LongShortConfig:
+    """Configuration for long/short portfolio optimization with leverage"""
+
+    # Position Limits
+    MAX_LONG_WEIGHT = 0.50  # Maximum long position per asset (50%)
+    MAX_SHORT_WEIGHT = -0.30  # Maximum short position per asset (-30%)
+
+    # Exposure Limits
+    GROSS_EXPOSURE_LIMIT = 1.80  # Maximum gross exposure (180%)
+    NET_EXPOSURE_TARGET = 1.00  # Target net exposure (100% - long bias)
+    NET_EXPOSURE_TOLERANCE = 0.10  # Tolerance around net target (±10%)
+
+    # Cost Parameters (annualized basis points)
+    LEVERAGE_COST_BPS = 200  # Cost of leverage/financing (2.00%)
+    BORROW_COST_BPS = 50  # Cost to borrow for short positions (0.50%)
+    SHORT_REBATE_BPS = 0  # Rebate on short proceeds (0% conservative)
+
+    # Risk Parameters
+    MAX_LEVERAGE_RATIO = 2.0  # Maximum leverage ratio (gross/net)
+    MARGIN_BUFFER = 0.25  # Margin buffer (25% above minimum requirements)
+
+    # Sector/Factor Exposure Limits (optional)
+    MAX_SECTOR_NET_EXPOSURE = 0.40  # Max net exposure to any sector (40%)
+    MAX_FACTOR_EXPOSURE = 0.50  # Max exposure to any risk factor (50%)
+
+    @classmethod
+    def get_daily_costs(cls):
+        """Convert annualized costs to daily basis points"""
+        return {
+            'leverage_cost_daily': cls.LEVERAGE_COST_BPS / config.TRADING_DAYS_PER_YEAR,
+            'borrow_cost_daily': cls.BORROW_COST_BPS / config.TRADING_DAYS_PER_YEAR,
+            'short_rebate_daily': cls.SHORT_REBATE_BPS / config.TRADING_DAYS_PER_YEAR
+        }
+
+    @classmethod
+    def validate_weights(cls, weights: pd.Series) -> Dict[str, bool]:
+        """Validate weights satisfy long/short constraints"""
+        gross_exposure = weights.abs().sum()
+        net_exposure = weights.sum()
+        leverage_ratio = gross_exposure / abs(net_exposure) if net_exposure != 0 else float('inf')
+
+        validation = {
+            'long_limits': (weights <= cls.MAX_LONG_WEIGHT).all(),
+            'short_limits': (weights >= cls.MAX_SHORT_WEIGHT).all(),
+            'gross_exposure': gross_exposure <= cls.GROSS_EXPOSURE_LIMIT,
+            'net_exposure': abs(net_exposure - cls.NET_EXPOSURE_TARGET) <= cls.NET_EXPOSURE_TOLERANCE,
+            'leverage_ratio': leverage_ratio <= cls.MAX_LEVERAGE_RATIO
+        }
+
+        validation['all_valid'] = all(validation.values())
+        validation['gross_exposure_value'] = gross_exposure
+        validation['net_exposure_value'] = net_exposure
+        validation['leverage_ratio_value'] = leverage_ratio
+
+        return validation
+
+# Create global long/short config instance
+ls_config = LongShortConfig()
+
 print("✅ Configuration loaded successfully")
 print(f"📊 Trading days per year: {config.TRADING_DAYS_PER_YEAR}")
 print(f"📈 Default volatility targets: {config.VOLATILITY_TARGETS}")
 print(f"🎯 Stress test max loss: {config.STRESS_TEST_MAX_LOSS}%")
+print(f"📊 Long/Short enabled: Gross limit {ls_config.GROSS_EXPOSURE_LIMIT:.0%}, Net target {ls_config.NET_EXPOSURE_TARGET:.0%}")
 
 
 # =============================================================================
@@ -119,14 +183,16 @@ class Portfolio:
     Handles data storage, path management, and basic utilities.
     """
     
-    def __init__(self, debug_mode: bool = True):
+    def __init__(self, debug_mode: bool = True, enable_long_short: bool = False):
         """
         Initialize portfolio with optional debug mode for safe testing.
-        
+
         Args:
             debug_mode: If True, writes outputs to temp folder to protect production data
+            enable_long_short: If True, enables long/short positions with leverage
         """
         self.debug_mode = debug_mode
+        self.enable_long_short = enable_long_short
         self.base_path = Path(config.get_base_path())
         
         # Core data containers - all DataFrames for consistency
@@ -151,11 +217,14 @@ class Portfolio:
         
         # Setup paths
         self._setup_paths()
-        
-        print(f"Portfolio initialized in {'DEBUG' if debug_mode else 'PRODUCTION'} mode")
+
+        mode_str = f"{'DEBUG' if debug_mode else 'PRODUCTION'} | {'LONG/SHORT' if enable_long_short else 'LONG-ONLY'}"
+        print(f"Portfolio initialized in {mode_str} mode")
         if debug_mode:
             print(f"🔒 All outputs will be written to: {self.output_path}")
             print("🔒 Production data will NOT be overwritten")
+        if enable_long_short:
+            print(f"📊 Long/Short enabled: Gross={ls_config.GROSS_EXPOSURE_LIMIT:.0%}, Net={ls_config.NET_EXPOSURE_TARGET:.0%}")
     
     def _setup_paths(self):
         """Setup input and output paths with debug mode safety"""
@@ -592,7 +661,8 @@ def optimize_portfolio(portfolio: Portfolio,
         try:
             result = _optimize_single_date(
                 portfolio, window, daily_vol_target, ma_short, ma_long,
-                use_variable_vol, use_stress_test, use_durations
+                use_variable_vol, use_stress_test, use_durations,
+                enable_long_short=portfolio.enable_long_short
             )
             
             if result['success']:
@@ -628,8 +698,9 @@ def _optimize_single_date(portfolio: Portfolio,
                          ma_short: pd.DataFrame,
                          ma_long: pd.DataFrame,
                          use_variable_vol: bool,
-                         use_stress_test: bool, 
-                         use_durations: bool) -> Dict[str, Any]:
+                         use_stress_test: bool,
+                         use_durations: bool,
+                         enable_long_short: bool = False) -> Dict[str, Any]:
     """
     Optimize portfolio for a single date with ALL constraints.
     """
@@ -707,31 +778,78 @@ def _optimize_single_date(portfolio: Portfolio,
             print(f"   ⚠️ Extreme momentum ratio {momentum_ratio:.3f}, skipping momentum adjustment")
         
         n_assets = len(portfolio.etf_order)
-        
-        # IMPROVED: Properly parameterized mean-variance optimization
+
+        # Get daily costs for long/short
+        daily_costs = ls_config.get_daily_costs() if enable_long_short else None
+
+        # IMPROVED: Properly parameterized mean-variance optimization with long/short costs
         def objective(weights):
             """Objective: Mean-variance optimization with theoretically grounded risk aversion"""
             portfolio_return = np.dot(weights, expected_returns.values)
             portfolio_variance = np.dot(weights, np.dot(cov_matrix.values, weights))
-            
+
             # Risk aversion parameter based on volatility target
             # Higher vol target = lower risk aversion
             risk_aversion = 1.0 / (daily_vol_target ** 2) if daily_vol_target > 0 else 1000
-            
-            # Standard mean-variance objective: maximize return - (risk_aversion/2) * variance
-            return -(portfolio_return - (risk_aversion / 2) * portfolio_variance)
+
+            # Add costs for long/short positions
+            total_cost = 0.0
+            if enable_long_short and daily_costs:
+                # Leverage cost on gross exposure above 1.0
+                gross_exposure = np.sum(np.abs(weights))
+                if gross_exposure > 1.0:
+                    leverage_amount = gross_exposure - 1.0
+                    total_cost += leverage_amount * daily_costs['leverage_cost_daily'] / 10000
+
+                # Short borrowing cost
+                short_weights = np.minimum(weights, 0)
+                short_exposure = np.abs(np.sum(short_weights))
+                total_cost += short_exposure * daily_costs['borrow_cost_daily'] / 10000
+
+                # Short rebate (typically minimal or zero)
+                total_cost -= short_exposure * daily_costs['short_rebate_daily'] / 10000
+
+            # Standard mean-variance objective: maximize return - costs - (risk_aversion/2) * variance
+            return -(portfolio_return - total_cost - (risk_aversion / 2) * portfolio_variance)
         
         # Define constraints
         constraints = []
         constraint_status = {}
-        
-        # 1. Budget constraint: weights sum to 1
-        constraints.append({
-            'type': 'eq',
-            'fun': lambda w: np.sum(w) - 1.0
-        })
-        constraint_status['budget'] = True
-        
+
+        # 1. Net exposure constraint: weights sum to net target
+        if enable_long_short:
+            # Long/short: net exposure equals target (e.g., 1.0 for 100% long bias)
+            def net_exposure_constraint(w):
+                return np.sum(w) - ls_config.NET_EXPOSURE_TARGET
+
+            constraints.append({
+                'type': 'eq',
+                'fun': net_exposure_constraint
+            })
+            constraint_status['net_exposure'] = True
+        else:
+            # Long-only: traditional budget constraint (weights sum to 1)
+            constraints.append({
+                'type': 'eq',
+                'fun': lambda w: np.sum(w) - 1.0
+            })
+            constraint_status['budget'] = True
+
+        # 1b. Gross exposure constraint (long/short only)
+        if enable_long_short:
+            def gross_exposure_constraint(w):
+                """Gross exposure = sum of absolute weights must be <= limit"""
+                return ls_config.GROSS_EXPOSURE_LIMIT - np.sum(np.abs(w))
+
+            constraints.append({
+                'type': 'ineq',
+                'fun': gross_exposure_constraint
+            })
+            constraint_status['gross_exposure'] = True
+            print(f"   📊 Added gross exposure constraint: <= {ls_config.GROSS_EXPOSURE_LIMIT:.0%}")
+        else:
+            constraint_status['gross_exposure'] = False
+
         # 2. SIMPLIFIED: Only add risk constraint if really needed
         # Remove risk constraint for faster convergence in most cases
         if daily_vol_target < 0.01:  # Only for very low vol targets
@@ -747,13 +865,27 @@ def _optimize_single_date(portfolio: Portfolio,
         else:
             constraint_status['risk'] = False
         
-        # 3. ⭐ CRITICAL: STRESS TEST CONSTRAINT - Previously missing! ⭐
+        # 3. ⭐ CRITICAL: STRESS TEST CONSTRAINT ⭐
         if use_stress_test and portfolio.stress_test_values is not None:
             def stress_test_constraint(weights):
                 """Portfolio stress loss must be > -15% (loss less than 15%)"""
-                portfolio_stress_loss = np.dot(weights, portfolio.stress_test_values.values)
+                if enable_long_short:
+                    # For long/short: stress test on gross positions
+                    # Apply stress to long positions, inverse to short positions
+                    long_weights = np.maximum(weights, 0)
+                    short_weights = np.minimum(weights, 0)
+
+                    # Long positions lose value, short positions gain (negative of stress)
+                    portfolio_stress_loss = (
+                        np.dot(long_weights, portfolio.stress_test_values.values) -
+                        np.dot(np.abs(short_weights), portfolio.stress_test_values.values)
+                    )
+                else:
+                    # Traditional long-only stress test
+                    portfolio_stress_loss = np.dot(weights, portfolio.stress_test_values.values)
+
                 return portfolio_stress_loss + config.STRESS_TEST_MAX_LOSS
-            
+
             constraints.append({
                 'type': 'ineq',
                 'fun': stress_test_constraint
@@ -785,8 +917,14 @@ def _optimize_single_date(portfolio: Portfolio,
         else:
             constraint_status['duration'] = False
         
-        # Weight bounds: 0 to MAX_WEIGHT_PER_ASSET
-        bounds = [(0.0, config.MAX_WEIGHT_PER_ASSET) for _ in range(n_assets)]
+        # Weight bounds: Long-only or Long/Short
+        if enable_long_short:
+            # Allow short positions
+            bounds = [(ls_config.MAX_SHORT_WEIGHT, ls_config.MAX_LONG_WEIGHT) for _ in range(n_assets)]
+            print(f"   📊 Weight bounds: [{ls_config.MAX_SHORT_WEIGHT:.0%}, {ls_config.MAX_LONG_WEIGHT:.0%}]")
+        else:
+            # Traditional long-only
+            bounds = [(0.0, config.MAX_WEIGHT_PER_ASSET) for _ in range(n_assets)]
         
         # IMPROVED: Even better initial guess
         try:
@@ -867,13 +1005,23 @@ def _optimize_single_date(portfolio: Portfolio,
             expected_return = np.dot(weights.values, expected_returns.values)
             portfolio_var = np.dot(weights.values, np.dot(cov_matrix.values, weights.values))
             portfolio_vol = np.sqrt(portfolio_var)
-            
+
             # Calculate stress test result if applicable
             stress_test_result = None
             if use_stress_test and portfolio.stress_test_values is not None:
-                stress_test_result = np.dot(weights.values, portfolio.stress_test_values.values)
-            
-            return {
+                if enable_long_short:
+                    # Long/short stress test
+                    long_weights = np.maximum(weights.values, 0)
+                    short_weights = np.minimum(weights.values, 0)
+                    stress_test_result = (
+                        np.dot(long_weights, portfolio.stress_test_values.values) -
+                        np.dot(np.abs(short_weights), portfolio.stress_test_values.values)
+                    )
+                else:
+                    stress_test_result = np.dot(weights.values, portfolio.stress_test_values.values)
+
+            # Calculate long/short specific metrics
+            result_dict = {
                 'success': True,
                 'weights': weights,
                 'expected_return': expected_return,
@@ -884,6 +1032,23 @@ def _optimize_single_date(portfolio: Portfolio,
                 'constraints_satisfied': constraint_status,
                 'optimization_result': result
             }
+
+            if enable_long_short:
+                gross_exposure = weights.abs().sum()
+                net_exposure = weights.sum()
+                long_exposure = weights[weights > 0].sum()
+                short_exposure = weights[weights < 0].sum()
+                leverage_ratio = gross_exposure / abs(net_exposure) if net_exposure != 0 else 0
+
+                result_dict.update({
+                    'gross_exposure': gross_exposure,
+                    'net_exposure': net_exposure,
+                    'long_exposure': long_exposure,
+                    'short_exposure': short_exposure,
+                    'leverage_ratio': leverage_ratio
+                })
+
+            return result_dict
         else:
             return {
                 'success': False, 
@@ -959,19 +1124,25 @@ def calculate_portfolio_performance(optimization_results: Dict[str, Any],
     
     # Calculate risk metrics
     risk_metrics = _calculate_risk_metrics(portfolio_returns, weights_df, portfolio.returns)
-    
+
+    # Calculate long/short metrics if applicable
+    long_short_metrics = None
+    if portfolio.enable_long_short:
+        long_short_metrics = calculate_long_short_metrics(optimization_results)
+
     # Combine all metrics
     full_performance = {
         'portfolio_returns': portfolio_returns,
         'weights': weights_df,
         'performance_metrics': performance_metrics,
         'risk_metrics': risk_metrics,
+        'long_short_metrics': long_short_metrics,
         'optimization_summary': _summarize_optimization_results(optimization_results)
     }
-    
+
     print(f"✅ Performance analysis completed")
-    _print_performance_summary(performance_metrics, risk_metrics)
-    
+    _print_performance_summary(performance_metrics, risk_metrics, long_short_metrics)
+
     return full_performance
 
 def _calculate_portfolio_returns(weights_df: pd.DataFrame, returns_df: pd.DataFrame) -> pd.Series:
@@ -1125,13 +1296,49 @@ def _summarize_optimization_results(optimization_results: Dict[str, Any]) -> Dic
     
     return summary
 
-def _print_performance_summary(performance_metrics: Dict[str, float], 
-                             risk_metrics: Dict[str, Any]):
+def calculate_long_short_metrics(optimization_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate long/short specific metrics from optimization results.
+
+    Args:
+        optimization_results: Results from optimize_portfolio()
+
+    Returns:
+        Dictionary with long/short metrics
+    """
+    results = optimization_results.get('results', [])
+    if not results or not any('gross_exposure' in r for r in results):
+        return {}
+
+    # Extract long/short metrics from results
+    gross_exposures = [r.get('gross_exposure', 0) for r in results if 'gross_exposure' in r]
+    net_exposures = [r.get('net_exposure', 0) for r in results if 'net_exposure' in r]
+    long_exposures = [r.get('long_exposure', 0) for r in results if 'long_exposure' in r]
+    short_exposures = [r.get('short_exposure', 0) for r in results if 'short_exposure' in r]
+    leverage_ratios = [r.get('leverage_ratio', 0) for r in results if 'leverage_ratio' in r]
+
+    if not gross_exposures:
+        return {}
+
+    return {
+        'avg_gross_exposure': np.mean(gross_exposures),
+        'max_gross_exposure': np.max(gross_exposures),
+        'min_gross_exposure': np.min(gross_exposures),
+        'avg_net_exposure': np.mean(net_exposures),
+        'avg_long_exposure': np.mean(long_exposures),
+        'avg_short_exposure': np.mean(short_exposures),
+        'avg_leverage_ratio': np.mean(leverage_ratios),
+        'max_leverage_ratio': np.max(leverage_ratios)
+    }
+
+def _print_performance_summary(performance_metrics: Dict[str, float],
+                             risk_metrics: Dict[str, Any],
+                             long_short_metrics: Dict[str, Any] = None):
     """Print formatted performance summary"""
-    
+
     if not performance_metrics:
         return
-    
+
     print("\n📈 PERFORMANCE SUMMARY")
     print("-" * 40)
     print(f"Annualized Return:     {performance_metrics['annualized_return']:>8.2%}")
@@ -1139,17 +1346,26 @@ def _print_performance_summary(performance_metrics: Dict[str, float],
     print(f"Sharpe Ratio:          {performance_metrics['sharpe_ratio']:>8.2f}")
     print(f"Max Drawdown:          {performance_metrics['max_drawdown']:>8.2%}")
     print(f"Total Return:          {performance_metrics['total_return']:>8.2%}")
-    
+
     if risk_metrics:
         print(f"\n🎯 RISK METRICS")
         print("-" * 40)
         print(f"VaR (95%, Annual):     {risk_metrics.get('var_95_annual', 0):>8.2%}")
         print(f"CVaR (95%, Annual):    {risk_metrics.get('cvar_95_annual', 0):>8.2%}")
-        
+
         conc = risk_metrics.get('concentration_metrics', {})
         if conc:
             print(f"Avg Effective Assets:  {conc.get('avg_effective_assets', 0):>8.1f}")
             print(f"Max Weight:            {conc.get('max_concentration', 0):>8.2%}")
+
+    if long_short_metrics:
+        print(f"\n📊 LONG/SHORT METRICS")
+        print("-" * 40)
+        print(f"Avg Gross Exposure:    {long_short_metrics.get('avg_gross_exposure', 0):>8.2%}")
+        print(f"Avg Net Exposure:      {long_short_metrics.get('avg_net_exposure', 0):>8.2%}")
+        print(f"Avg Long Exposure:     {long_short_metrics.get('avg_long_exposure', 0):>8.2%}")
+        print(f"Avg Short Exposure:    {long_short_metrics.get('avg_short_exposure', 0):>8.2%}")
+        print(f"Avg Leverage Ratio:    {long_short_metrics.get('avg_leverage_ratio', 0):>8.2f}")
 
 def compare_with_benchmark(portfolio_performance: Dict[str, Any], 
                           portfolio: Portfolio) -> Dict[str, Any]:
