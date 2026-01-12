@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Debug folders
+folio_beyond_debug_*/
+
+# Data and other project folders
+SharedFolioBeyond/
+FolioBeyond_OldCode/
+Mathematica Code/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Excel temp files
+~$*.xlsx
+~$*.xls
