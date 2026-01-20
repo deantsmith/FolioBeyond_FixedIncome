@@ -878,6 +878,10 @@ def _optimize_single_date(portfolio: Portfolio,
     try:
         start_date, end_date = window
         
+        # FIX: Pre-compute annualized vol target since cov_matrix is ANNUALIZED
+        # This is used in both the objective function and risk constraint
+        annualized_vol_target = daily_vol_target * config.SQRT_TRADING_DAYS
+        
         # Get returns data for the window
         window_returns = portfolio.returns.loc[start_date:end_date]
         if window_returns.empty:
@@ -988,7 +992,10 @@ def _optimize_single_date(portfolio: Portfolio,
 
             # Risk aversion parameter based on volatility target
             # Higher vol target = lower risk aversion
-            risk_aversion = 1.0 / (daily_vol_target ** 2) if daily_vol_target > 0 else 1000
+            # FIX: Use ANNUALIZED vol target since cov_matrix is ANNUALIZED (line 910)
+            # Previously used daily_vol_target which made risk_aversion ~250x too high!
+            # annualized_vol_target is pre-computed at function start
+            risk_aversion = 1.0 / (annualized_vol_target ** 2) if annualized_vol_target > 0 else 1000
 
             # Add costs for long/short positions
             total_cost = 0.0
@@ -1056,23 +1063,35 @@ def _optimize_single_date(portfolio: Portfolio,
         else:
             constraint_status['gross_exposure'] = False
 
-        # 2. SIMPLIFIED: Only add risk constraint if really needed
-        # Remove risk constraint for faster convergence in most cases
-        # FIX: Use annualized vol target since cov_matrix is annualized
-        annualized_vol_target = daily_vol_target * config.SQRT_TRADING_DAYS
-        if daily_vol_target < 0.01:  # Only for very low vol targets
-            def risk_constraint(weights):
-                portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
-                # Compare annualized variance to annualized target (with 20% slack)
-                return (annualized_vol_target * 1.2)**2 - portfolio_var
+        # 2. VOLATILITY BAND CONSTRAINT
+        # FIX: Add BOTH upper AND lower bounds to target volatility within a band
+        # Without lower bound, optimizer chooses very conservative portfolios with low vol
+        # Note: annualized_vol_target is pre-computed at function start
+        
+        # Upper bound: prevent volatility from exceeding target + 20%
+        def risk_upper_constraint(weights):
+            portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
+            # Constraint: portfolio_var <= (target * 1.2)^2
+            return (annualized_vol_target * 1.2)**2 - portfolio_var
 
-            constraints.append({
-                'type': 'ineq',
-                'fun': risk_constraint
-            })
-            constraint_status['risk'] = True
-        else:
-            constraint_status['risk'] = False
+        constraints.append({
+            'type': 'ineq',
+            'fun': risk_upper_constraint
+        })
+        
+        # Lower bound: prevent volatility from being too far below target
+        # Allow 40% below target to give optimizer some flexibility
+        def risk_lower_constraint(weights):
+            portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
+            # Constraint: portfolio_var >= (target * 0.6)^2
+            return portfolio_var - (annualized_vol_target * 0.6)**2
+
+        constraints.append({
+            'type': 'ineq',
+            'fun': risk_lower_constraint
+        })
+        constraint_status['risk'] = True
+        print(f"   📊 Added volatility band constraint: {annualized_vol_target*0.6:.1%} to {annualized_vol_target*1.2:.1%}")
         
         # 3. ⭐ CRITICAL: STRESS TEST CONSTRAINT ⭐
         # FIX 1A: Calculate PIT stress values if enabled
@@ -1246,6 +1265,16 @@ def _optimize_single_date(portfolio: Portfolio,
             expected_return = np.dot(weights.values, expected_returns.values)
             portfolio_var = np.dot(weights.values, np.dot(cov_matrix.values, weights.values))
             portfolio_vol = np.sqrt(portfolio_var)
+
+            # DIAGNOSTIC: Sharpe ratio component analysis
+            sharpe_ratio_calc = expected_return / portfolio_vol if portfolio_vol > 0 else 0
+            print(f"   📊 SHARPE DIAGNOSTIC for {end_date.strftime('%Y-%m-%d')}:")
+            print(f"      Expected Return (annual): {expected_return:.6f} ({expected_return*100:.4f}%)")
+            print(f"      Portfolio Vol (annual):   {portfolio_vol:.6f} ({portfolio_vol*100:.4f}%)")
+            print(f"      Sharpe Ratio:             {sharpe_ratio_calc:.4f}")
+            print(f"      Input expected_returns range: {expected_returns.min():.6f} to {expected_returns.max():.6f}")
+            print(f"      Cov matrix diagonal (ann vol^2): {np.diag(cov_matrix.values).min():.8f} to {np.diag(cov_matrix.values).max():.8f}")
+            print(f"      Implied asset vols (annual): {np.sqrt(np.diag(cov_matrix.values)).min():.4f} to {np.sqrt(np.diag(cov_matrix.values)).max():.4f}")
 
             # Calculate stress test result if applicable (FIX 1A: uses PIT values when enabled)
             stress_test_result = None
@@ -1503,7 +1532,16 @@ def _calculate_performance_metrics(portfolio_returns: pd.Series) -> Dict[str, fl
     annualized_return = mean_return * config.TRADING_DAYS_PER_YEAR
     annualized_volatility = std_return * config.SQRT_TRADING_DAYS
     sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility > 0 else 0
-    
+
+    # DIAGNOSTIC: Performance Sharpe ratio component analysis
+    print(f"   📈 PERFORMANCE SHARPE DIAGNOSTIC:")
+    print(f"      Daily mean return:        {mean_return:.8f} ({mean_return*100:.6f}%)")
+    print(f"      Daily std return:         {std_return:.8f} ({std_return*100:.6f}%)")
+    print(f"      Annualized return:        {annualized_return:.6f} ({annualized_return*100:.4f}%)")
+    print(f"      Annualized volatility:    {annualized_volatility:.6f} ({annualized_volatility*100:.4f}%)")
+    print(f"      Performance Sharpe Ratio: {sharpe_ratio:.4f}")
+    print(f"      Sample returns range:     {adjusted_returns.min():.8f} to {adjusted_returns.max():.8f}")
+
     # Cumulative metrics
     cumulative_returns = (1 + adjusted_returns / 100).cumprod() if adjusted_returns.abs().max() < 10 else (1 + adjusted_returns).cumprod()
     total_return = cumulative_returns.iloc[-1] - 1
