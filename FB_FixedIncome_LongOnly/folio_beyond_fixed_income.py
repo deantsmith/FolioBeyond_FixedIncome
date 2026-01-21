@@ -30,6 +30,13 @@ import pandas_market_calendars as mcal
 import warnings
 warnings.filterwarnings('ignore')
 
+# FIX 2D: Environment configuration support
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file if present
+except ImportError:
+    pass  # python-dotenv not installed, will use os.environ directly
+
 # =============================================================================
 # CONFIGURATION CLASS - All parameters in one place
 # =============================================================================
@@ -44,6 +51,11 @@ class Config:
     
     # Transaction Costs
     DAILY_TRANSACTION_COST_BP = 2 * 6.66667 / TRADING_DAYS_PER_YEAR  # basis points
+
+    # FIX 3A: Transaction Cost Awareness in Optimizer
+    # TC penalty in objective function to prevent signal churning
+    TC_BPS_PER_TRADE = 10  # One-way transaction cost in basis points (0.10%)
+    TC_INCLUDE_IN_OPTIMIZER = True  # Set to False to disable TC penalty in optimization
     
     # Optimization Parameters
     LOOKBACK_WINDOW_DAYS = 730  # ~2 years
@@ -90,10 +102,28 @@ class Config:
         {'name': 'RRS', 'vol_target': 'RRS', 'use_variable_vol': False, 'use_stress_test': True},
     ]
     
+    # FIX 2D: Default paths (can be overridden via environment variables)
+    DEFAULT_BASE_PATH = '/Users/deansmith/FolioBeyond Dropbox/Dean Smith/SharedFolioBeyond'
+
     @classmethod
     def get_base_path(cls):
-        """Determine base path based on environment"""
-        return '/Users/deansmith/FolioBeyond Dropbox/Dean Smith/SharedFolioBeyond'
+        """
+        Determine base path based on environment.
+
+        FIX 2D: Priority order:
+        1. FOLIOBEYOND_BASE_PATH environment variable
+        2. Default path (development/production fallback)
+
+        To configure, set environment variable or create .env file:
+            FOLIOBEYOND_BASE_PATH=/path/to/your/SharedFolioBeyond
+        """
+        base_path = os.environ.get('FOLIOBEYOND_BASE_PATH')
+
+        if base_path:
+            return base_path
+
+        # Development default
+        return cls.DEFAULT_BASE_PATH
     
     @classmethod  
     def get_volatility_target(cls, portfolio_type: str) -> float:
@@ -103,10 +133,74 @@ class Config:
 # Create global config instance
 config = Config()
 
+# =============================================================================
+# LONG/SHORT CONFIGURATION CLASS
+# =============================================================================
+
+class LongShortConfig:
+    """Configuration for long/short portfolio optimization with leverage"""
+
+    # Position Limits
+    MAX_LONG_WEIGHT = 0.50  # Maximum long position per asset (50%)
+    MAX_SHORT_WEIGHT = -0.30  # Maximum short position per asset (-30%)
+
+    # Exposure Limits
+    GROSS_EXPOSURE_LIMIT = 1.80  # Maximum gross exposure (180%)
+    NET_EXPOSURE_TARGET = 1.00  # Target net exposure (100% - long bias)
+    NET_EXPOSURE_TOLERANCE = 0.10  # Tolerance around net target (±10%)
+
+    # Cost Parameters (annualized basis points)
+    LEVERAGE_COST_BPS = 200  # Cost of leverage/financing (2.00%)
+    BORROW_COST_BPS = 50  # Cost to borrow for short positions (0.50%)
+    SHORT_REBATE_BPS = 0  # Rebate on short proceeds (0% conservative)
+
+    # Risk Parameters
+    MAX_LEVERAGE_RATIO = 2.0  # Maximum leverage ratio (gross/net)
+    MARGIN_BUFFER = 0.25  # Margin buffer (25% above minimum requirements)
+
+    # Sector/Factor Exposure Limits (optional)
+    MAX_SECTOR_NET_EXPOSURE = 0.40  # Max net exposure to any sector (40%)
+    MAX_FACTOR_EXPOSURE = 0.50  # Max exposure to any risk factor (50%)
+
+    @classmethod
+    def get_daily_costs(cls):
+        """Convert annualized costs to daily basis points"""
+        return {
+            'leverage_cost_daily': cls.LEVERAGE_COST_BPS / config.TRADING_DAYS_PER_YEAR,
+            'borrow_cost_daily': cls.BORROW_COST_BPS / config.TRADING_DAYS_PER_YEAR,
+            'short_rebate_daily': cls.SHORT_REBATE_BPS / config.TRADING_DAYS_PER_YEAR
+        }
+
+    @classmethod
+    def validate_weights(cls, weights: pd.Series) -> Dict[str, bool]:
+        """Validate weights satisfy long/short constraints"""
+        gross_exposure = weights.abs().sum()
+        net_exposure = weights.sum()
+        leverage_ratio = gross_exposure / abs(net_exposure) if net_exposure != 0 else float('inf')
+
+        validation = {
+            'long_limits': (weights <= cls.MAX_LONG_WEIGHT).all(),
+            'short_limits': (weights >= cls.MAX_SHORT_WEIGHT).all(),
+            'gross_exposure': gross_exposure <= cls.GROSS_EXPOSURE_LIMIT,
+            'net_exposure': abs(net_exposure - cls.NET_EXPOSURE_TARGET) <= cls.NET_EXPOSURE_TOLERANCE,
+            'leverage_ratio': leverage_ratio <= cls.MAX_LEVERAGE_RATIO
+        }
+
+        validation['all_valid'] = all(validation.values())
+        validation['gross_exposure_value'] = gross_exposure
+        validation['net_exposure_value'] = net_exposure
+        validation['leverage_ratio_value'] = leverage_ratio
+
+        return validation
+
+# Create global long/short config instance
+ls_config = LongShortConfig()
+
 print("✅ Configuration loaded successfully")
 print(f"📊 Trading days per year: {config.TRADING_DAYS_PER_YEAR}")
 print(f"📈 Default volatility targets: {config.VOLATILITY_TARGETS}")
 print(f"🎯 Stress test max loss: {config.STRESS_TEST_MAX_LOSS}%")
+print(f"📊 Long/Short enabled: Gross limit {ls_config.GROSS_EXPOSURE_LIMIT:.0%}, Net target {ls_config.NET_EXPOSURE_TARGET:.0%}")
 
 
 # =============================================================================
@@ -119,14 +213,16 @@ class Portfolio:
     Handles data storage, path management, and basic utilities.
     """
     
-    def __init__(self, debug_mode: bool = True):
+    def __init__(self, debug_mode: bool = True, enable_long_short: bool = False):
         """
         Initialize portfolio with optional debug mode for safe testing.
-        
+
         Args:
             debug_mode: If True, writes outputs to temp folder to protect production data
+            enable_long_short: If True, enables long/short positions with leverage
         """
         self.debug_mode = debug_mode
+        self.enable_long_short = enable_long_short
         self.base_path = Path(config.get_base_path())
         
         # Core data containers - all DataFrames for consistency
@@ -134,6 +230,7 @@ class Portfolio:
         self.prices = None
         self.projected_returns = None
         self.stress_test_values = None  # pd.Series
+        self.use_pit_stress = True  # FIX 1A: Default to Point-in-Time stress testing
         self.volatility_scaling_ratios = None  # pd.Series
         self.variable_vol = None
         self.durations = None
@@ -151,11 +248,14 @@ class Portfolio:
         
         # Setup paths
         self._setup_paths()
-        
-        print(f"Portfolio initialized in {'DEBUG' if debug_mode else 'PRODUCTION'} mode")
+
+        mode_str = f"{'DEBUG' if debug_mode else 'PRODUCTION'} | {'LONG/SHORT' if enable_long_short else 'LONG-ONLY'}"
+        print(f"Portfolio initialized in {mode_str} mode")
         if debug_mode:
             print(f"🔒 All outputs will be written to: {self.output_path}")
             print("🔒 Production data will NOT be overwritten")
+        if enable_long_short:
+            print(f"📊 Long/Short enabled: Gross={ls_config.GROSS_EXPOSURE_LIMIT:.0%}, Net={ls_config.NET_EXPOSURE_TARGET:.0%}")
     
     def _setup_paths(self):
         """Setup input and output paths with debug mode safety"""
@@ -332,122 +432,245 @@ def load_portfolio_data(portfolio: Portfolio, strategy_name: str) -> bool:
         print(f"❌ Error loading data for {strategy_name}: {e}")
         return False
 
-def _load_stress_test_data(portfolio: Portfolio, file_path: Path) -> bool:
-    """Load stress test values and ETF order"""
+def _load_stress_test_data(portfolio: Portfolio, file_path: Path,
+                          use_pit_stress: bool = True) -> bool:
+    """
+    Load stress test values and ETF order.
+
+    FIX 1A: Added use_pit_stress parameter to enable Point-in-Time stress testing.
+
+    Args:
+        portfolio: Portfolio object to populate
+        file_path: Path to stress test Excel file
+        use_pit_stress: If True, stress values will be calculated PIT during optimization.
+                       If False, uses static file (legacy behavior with look-ahead bias warning).
+    """
     try:
         if not file_path.exists():
             print(f"⚠️ Stress test file not found: {file_path}")
             # Create default values if file missing
             portfolio.etf_order = ['AGG', 'BND', 'VCIT', 'VGIT', 'VTEB']  # Default bond ETFs
-            portfolio.stress_test_values = pd.Series([0.0] * len(portfolio.etf_order), 
-                                                   index=portfolio.etf_order)
+            portfolio.stress_test_values = None  # Will be calculated PIT
+            portfolio.use_pit_stress = True
             return True
-            
+
         df = pd.read_excel(file_path, header=None)
-        #drop the first column ("Date")from df as it is not used in the stress test 
-        df = df.drop(columns=[0])   
+        # Drop the first column ("Date") from df as it is not used in the stress test
+        df = df.drop(columns=[0])
 
         # Extract ETF order from first row
         portfolio.etf_order = df.iloc[0].dropna().tolist()
-        
-        # Extract stress test values from second row, starting from column 4
-        stress_values = df.iloc[1].dropna().values
-        if len(stress_values) > 0:
-            portfolio.stress_test_values = pd.Series(
-                stress_values[:len(portfolio.etf_order)], 
-                index=portfolio.etf_order
-            )
+
+        if use_pit_stress:
+            # FIX 1A: Mark for PIT calculation during optimization
+            portfolio.stress_test_values = None
+            portfolio.use_pit_stress = True
+            print(f"   📋 ETF order: {portfolio.etf_order}")
+            print(f"   🔒 Using Point-in-Time stress testing (look-ahead bias eliminated)")
         else:
-            portfolio.stress_test_values = pd.Series([0.0] * len(portfolio.etf_order), 
-                                                   index=portfolio.etf_order)
-        
-        print(f"   📋 ETF order: {portfolio.etf_order}")
+            # Legacy: load static values (with warning)
+            print(f"   ⚠️ WARNING: Using static stress values - potential look-ahead bias!")
+            stress_values = df.iloc[1].dropna().values
+            if len(stress_values) > 0:
+                portfolio.stress_test_values = pd.Series(
+                    stress_values[:len(portfolio.etf_order)],
+                    index=portfolio.etf_order
+                )
+            else:
+                portfolio.stress_test_values = pd.Series([0.0] * len(portfolio.etf_order),
+                                                       index=portfolio.etf_order)
+            portfolio.use_pit_stress = False
+            print(f"   📋 ETF order: {portfolio.etf_order}")
+
         return True
-        
+
     except Exception as e:
         print(f"❌ Error loading stress test data: {e}")
         return False
 
+
+def _calculate_pit_stress_values(portfolio: Portfolio, current_date: pd.Timestamp,
+                                  lookback_days: int = 730,
+                                  min_stress_floor: float = -5.0) -> pd.Series:
+    """
+    FIX 1A: Calculate Point-in-Time stress test values using only historical data.
+
+    Uses maximum drawdown over lookback period as stress scenario.
+    This eliminates look-ahead bias by only using data available at current_date.
+
+    Args:
+        portfolio: Portfolio with returns data
+        current_date: The date as of which to calculate stress values
+        lookback_days: Number of days to look back for max drawdown (default 730 = ~2 years)
+        min_stress_floor: Minimum stress value to prevent overly mild stress in calm periods
+
+    Returns:
+        Series of stress values (negative percentages) indexed by ETF
+    """
+    try:
+        # Get returns up to current_date only (no future data)
+        available_returns = portfolio.returns.loc[:current_date]
+
+        if len(available_returns) < 30:
+            print(f"   ⚠️ Insufficient history for PIT stress test: {len(available_returns)} days")
+            # Return minimum stress floor for all assets
+            return pd.Series(min_stress_floor, index=portfolio.etf_order)
+
+        # Use only the lookback window (or all available if less)
+        actual_lookback = min(lookback_days, len(available_returns))
+        window_returns = available_returns.iloc[-actual_lookback:]
+
+        # Calculate cumulative returns for each ETF
+        # Returns are in percentage terms (scaled by 100), so divide by 100
+        cumulative = (1 + window_returns / config.SCALE_FACTOR_FOR_RETURNS).cumprod()
+
+        # Calculate maximum drawdown per ETF
+        running_max = cumulative.cummax()
+        drawdowns = (cumulative - running_max) / running_max
+        max_drawdowns = drawdowns.min() * 100  # Convert back to percentage
+
+        # Apply minimum stress floor to prevent overly mild stress in calm periods
+        max_drawdowns = max_drawdowns.clip(upper=min_stress_floor)
+
+        return max_drawdowns
+
+    except Exception as e:
+        print(f"   ⚠️ Error calculating PIT stress values: {e}")
+        # Return minimum stress floor for all assets as fallback
+        return pd.Series(min_stress_floor, index=portfolio.etf_order)
+
+# =============================================================================
+# FIX 2C: GENERIC TIME SERIES LOADER
+# =============================================================================
+
+def load_time_series(path: Path,
+                     index_col: str = 'Date',
+                     parse_dates: bool = True,
+                     sort_index: bool = True,
+                     required: bool = True,
+                     fill_value: Any = None,
+                     columns_order: List[str] = None) -> Optional[pd.DataFrame]:
+    """
+    FIX 2C: Generic time series loader with validation.
+
+    Reduces code duplication across multiple loader functions.
+
+    Args:
+        path: Path to CSV or Excel file
+        index_col: Column to use as index (default 'Date')
+        parse_dates: Whether to parse dates (default True)
+        sort_index: Whether to sort by index (default True)
+        required: If True, raise error if file missing; if False, return None
+        fill_value: Value to fill missing data when reindexing columns
+        columns_order: List of columns to reindex to (maintains order consistency)
+
+    Returns:
+        DataFrame or None if file missing and not required
+    """
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"Required file not found: {path}")
+        return None
+
+    # Determine file type and load
+    suffix = path.suffix.lower()
+    if suffix == '.csv':
+        df = pd.read_csv(path, index_col=index_col, parse_dates=parse_dates)
+    elif suffix in ['.xlsx', '.xls']:
+        df = pd.read_excel(path, index_col=index_col)
+        if parse_dates and df.index.dtype != 'datetime64[ns]':
+            df.index = pd.to_datetime(df.index)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
+
+    if sort_index:
+        df.sort_index(inplace=True)
+
+    if columns_order is not None:
+        df = df.reindex(columns=columns_order, fill_value=fill_value)
+
+    return df
+
+
 def _load_returns_data(portfolio: Portfolio, file_path: Path) -> bool:
     """Load daily returns data"""
     try:
-        if not file_path.exists():
-            raise FileNotFoundError(f"Returns file not found: {file_path}")
-            
-        portfolio.returns = pd.read_csv(file_path, index_col='Date', parse_dates=True)
-        portfolio.returns.sort_index(inplace=True)
-        
-        # Align with ETF order
-        portfolio.returns = portfolio.returns.reindex(columns=portfolio.etf_order, fill_value=0)
-        
+        # FIX 2C: Use generic loader
+        portfolio.returns = load_time_series(
+            file_path,
+            required=True,
+            columns_order=portfolio.etf_order,
+            fill_value=0
+        )
         print(f"   📈 Returns shape: {portfolio.returns.shape}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error loading returns data: {e}")
         return False
 
+
 def _load_projected_returns(portfolio: Portfolio, file_path: Path) -> bool:
     """Load projected returns (yield) data"""
     try:
-        if not file_path.exists():
-            raise FileNotFoundError(f"Projected returns file not found: {file_path}")
-            
-        portfolio.projected_returns = pd.read_csv(file_path, index_col='Date', parse_dates=True)
-        portfolio.projected_returns.sort_index(inplace=True)
-        
-        # Align with ETF order
-        portfolio.projected_returns = portfolio.projected_returns.reindex(
-            columns=portfolio.etf_order, fill_value=0)
-        
+        # FIX 2C: Use generic loader
+        portfolio.projected_returns = load_time_series(
+            file_path,
+            required=True,
+            columns_order=portfolio.etf_order,
+            fill_value=0
+        )
         print(f"   🎯 Projected returns shape: {portfolio.projected_returns.shape}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error loading projected returns: {e}")
         return False
 
+
 def _load_volatility_scaling(portfolio: Portfolio, file_path: Path) -> bool:
     """Load volatility scaling ratios"""
     try:
-        if not file_path.exists():
+        # FIX 2C: Use generic loader with optional file handling
+        df = load_time_series(file_path, required=False)
+
+        if df is None:
             print(f"⚠️ Volatility scaling file not found, using default values")
-            portfolio.volatility_scaling_ratios = pd.Series([1.0], 
+            portfolio.volatility_scaling_ratios = pd.Series([1.0],
                                                            index=[pd.Timestamp.now()])
             return True
-            
-        df = pd.read_csv(file_path, index_col='Date', parse_dates=True)
+
         portfolio.volatility_scaling_ratios = df.iloc[:, 2]  # Third column
-        portfolio.volatility_scaling_ratios.sort_index(inplace=True)
-        
         print(f"   📏 Volatility scaling shape: {portfolio.volatility_scaling_ratios.shape}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error loading volatility scaling: {e}")
         return False
 
+
 def _load_variable_vol_data(portfolio: Portfolio, file_path: Path) -> bool:
     """Load variable volatility data"""
     try:
-        if not file_path.exists():
+        # FIX 2C: Use generic loader with optional file handling
+        df = load_time_series(
+            file_path,
+            required=False,
+            columns_order=portfolio.etf_order,
+            fill_value=0.035
+        )
+
+        if df is None:
             print(f"⚠️ Variable vol file not found, using default values")
-            # Create default values aligned with returns dates
             if portfolio.returns is not None:
                 portfolio.variable_vol = pd.DataFrame(
                     0.035, index=portfolio.returns.index, columns=portfolio.etf_order)
             return True
-            
-        portfolio.variable_vol = pd.read_csv(file_path, index_col='Date', parse_dates=True)
-        portfolio.variable_vol.sort_index(inplace=True)
-        
-        # Align with ETF order
-        portfolio.variable_vol = portfolio.variable_vol.reindex(
-            columns=portfolio.etf_order, fill_value=0.035)
-        
+
+        portfolio.variable_vol = df
         print(f"   📊 Variable vol shape: {portfolio.variable_vol.shape}")
         return True
-        
+
     except Exception as e:
         print(f"❌ Error loading variable vol data: {e}")
         return False
@@ -584,32 +807,46 @@ def optimize_portfolio(portfolio: Portfolio,
     # Storage for results
     all_results = []
     successful_optimizations = 0
-    
+    previous_weights = None  # FIX 1B: Track previous weights for fallback
+
     for i, window in enumerate(optimization_windows):
         if i % 50 == 0:  # Progress reporting
             print(f"   Processing window {i+1}/{len(optimization_windows)}")
-            
+
         try:
             result = _optimize_single_date(
                 portfolio, window, daily_vol_target, ma_short, ma_long,
-                use_variable_vol, use_stress_test, use_durations
+                use_variable_vol, use_stress_test, use_durations,
+                enable_long_short=portfolio.enable_long_short,
+                previous_weights=previous_weights  # FIX 1B: Pass previous weights
             )
-            
+
             if result['success']:
                 successful_optimizations += 1
-                all_results.append({
+                # Update previous_weights for next iteration
+                previous_weights = result['weights']
+
+                result_entry = {
                     'date': window[1],
                     'weights': result['weights'],
-                    'expected_return': result['expected_return'], 
+                    'expected_return': result['expected_return'],
                     'volatility': result['volatility'],
                     'sharpe_ratio': result['sharpe_ratio'],
                     'covariance_matrix': result['covariance_matrix'],
                     'stress_test_result': result.get('stress_test_result'),
                     'constraints_satisfied': result.get('constraints_satisfied', {})
-                })
+                }
+
+                # FIX 1B: Track fallback usage if applicable
+                if result.get('fallback_used'):
+                    result_entry['fallback_used'] = result['fallback_used']
+                    result_entry['original_failure'] = result.get('original_failure')
+                    result_entry['constraint_violations'] = result.get('constraint_violations')
+
+                all_results.append(result_entry)
             else:
                 print(f"   ⚠️ Optimization failed for window {i}: {result.get('error')}")
-                
+
         except Exception as e:
             print(f"   ❌ Error in window {i}: {str(e)}")
             continue
@@ -628,13 +865,22 @@ def _optimize_single_date(portfolio: Portfolio,
                          ma_short: pd.DataFrame,
                          ma_long: pd.DataFrame,
                          use_variable_vol: bool,
-                         use_stress_test: bool, 
-                         use_durations: bool) -> Dict[str, Any]:
+                         use_stress_test: bool,
+                         use_durations: bool,
+                         enable_long_short: bool = False,
+                         previous_weights: Optional[pd.Series] = None) -> Dict[str, Any]:
     """
     Optimize portfolio for a single date with ALL constraints.
+
+    FIX 1B: Added previous_weights parameter for proper failure handling.
+    On optimization failure, will use previous_weights instead of dropping constraints.
     """
     try:
         start_date, end_date = window
+        
+        # FIX: Pre-compute annualized vol target since cov_matrix is ANNUALIZED
+        # This is used in both the objective function and risk constraint
+        annualized_vol_target = daily_vol_target * config.SQRT_TRADING_DAYS
         
         # Get returns data for the window
         window_returns = portfolio.returns.loc[start_date:end_date]
@@ -653,15 +899,16 @@ def _optimize_single_date(portfolio: Portfolio,
             return {'success': False, 'error': 'Returns data contains NaN values'}
         
         # Get expected returns for the end date
-        if end_date in portfolio.projected_returns.index:
-            expected_returns = portfolio.projected_returns.loc[end_date] / config.SCALE_FACTOR_FOR_RETURNS
-        else:
-            # Fallback to historical mean
-            expected_returns = scaled_returns.mean() * config.TRADING_DAYS_PER_YEAR
-        
+        # FIX 1C: Enforce single methodology - no fallback to historical mean
+        if end_date not in portfolio.projected_returns.index:
+            return {'success': False, 'error': f'Missing projected returns for {end_date} - data gap (no fallback to historical mean)'}
+
+        expected_returns = portfolio.projected_returns.loc[end_date] / config.SCALE_FACTOR_FOR_RETURNS
+
         # Check for NaN in expected returns
         if expected_returns.isnull().any():
-            return {'success': False, 'error': 'Expected returns contain NaN values'}
+            missing_assets = expected_returns[expected_returns.isnull()].index.tolist()
+            return {'success': False, 'error': f'Missing projected returns for assets: {missing_assets}'}
         
         # Calculate covariance matrix
         cov_matrix = scaled_returns.cov() * config.TRADING_DAYS_PER_YEAR
@@ -673,14 +920,32 @@ def _optimize_single_date(portfolio: Portfolio,
         if np.isinf(cov_matrix.values).any():
             return {'success': False, 'error': 'Covariance matrix contains infinite values'}
         
-        # Check if covariance matrix is positive definite
+        # FIX 3B: Enhanced positive definiteness check with Ledoit-Wolf shrinkage
         try:
             eigenvals = np.linalg.eigvals(cov_matrix.values)
-            min_eigenval = np.min(eigenvals)
+            min_eigenval = np.min(np.real(eigenvals))  # Use real part for numerical stability
+
             if min_eigenval <= 1e-8:  # Effectively singular
                 print(f"   ⚠️ Covariance matrix is nearly singular (min eigenvalue: {min_eigenval:.2e})")
-                # Add regularization to diagonal
-                cov_matrix += np.eye(len(cov_matrix)) * 1e-6
+
+                # Apply Ledoit-Wolf shrinkage (more principled than simple diagonal regularization)
+                n = len(cov_matrix)
+                mu = np.trace(cov_matrix.values) / n  # Average variance
+
+                # Shrinkage intensity (adaptive based on how singular the matrix is)
+                shrinkage_intensity = min(0.3, max(0.05, -np.log10(max(min_eigenval, 1e-15)) / 20))
+
+                # Shrink towards scaled identity matrix
+                cov_shrunk = (1 - shrinkage_intensity) * cov_matrix.values + shrinkage_intensity * mu * np.eye(n)
+                cov_matrix = pd.DataFrame(cov_shrunk, index=cov_matrix.index, columns=cov_matrix.columns)
+
+                print(f"   🔧 Applied Ledoit-Wolf shrinkage (intensity: {shrinkage_intensity:.3f})")
+
+                # Verify fix worked
+                new_eigenvals = np.linalg.eigvals(cov_matrix.values)
+                new_min = np.min(np.real(new_eigenvals))
+                print(f"   ✓ Post-shrinkage min eigenvalue: {new_min:.2e}")
+
         except np.linalg.LinAlgError:
             return {'success': False, 'error': 'Covariance matrix eigenvalue computation failed'}
         
@@ -696,64 +961,170 @@ def _optimize_single_date(portfolio: Portfolio,
                 cov_matrix = cov_matrix.values * scaling_matrix
                 cov_matrix = pd.DataFrame(cov_matrix, index=cov_matrix.index, columns=cov_matrix.columns)
         
-        # Get momentum adjustment (FIXED: More conservative application)
+        # Get momentum adjustment
         momentum_ratio = _calculate_momentum_ratio(portfolio.prices, ma_short, ma_long, end_date)
-        
-        # Apply momentum to covariance more conservatively
+
+        # FIX 1D: Apply momentum to expected returns (μ), NOT covariance matrix (Σ)
+        # Momentum signals should scale return expectations, not volatility
         if momentum_ratio is not None and 0.5 <= momentum_ratio <= 2.0:
-            # Only apply reasonable momentum adjustments
-            cov_matrix *= momentum_ratio
+            expected_returns = expected_returns * momentum_ratio
+            print(f"   Applied momentum ratio {momentum_ratio:.3f} to expected returns")
         elif momentum_ratio is not None:
             print(f"   ⚠️ Extreme momentum ratio {momentum_ratio:.3f}, skipping momentum adjustment")
+        # NOTE: Covariance matrix is NOT scaled by momentum (use EWMA/GARCH for vol regime scaling if needed)
         
         n_assets = len(portfolio.etf_order)
-        
-        # IMPROVED: Properly parameterized mean-variance optimization
+
+        # Get daily costs for long/short
+        daily_costs = ls_config.get_daily_costs() if enable_long_short else None
+
+        # IMPROVED: Properly parameterized mean-variance optimization with long/short costs
+        # FIX 3A: Added transaction cost awareness to prevent signal churning
         def objective(weights):
-            """Objective: Mean-variance optimization with theoretically grounded risk aversion"""
+            """
+            Objective: Mean-variance optimization with theoretically grounded risk aversion.
+
+            FIX 3A: Includes transaction cost penalty to reduce turnover:
+            Maximize: w'μ - TC × |w_t - w_{t-1}| - (λ/2) × w'Σw
+            """
             portfolio_return = np.dot(weights, expected_returns.values)
             portfolio_variance = np.dot(weights, np.dot(cov_matrix.values, weights))
-            
+
             # Risk aversion parameter based on volatility target
             # Higher vol target = lower risk aversion
-            risk_aversion = 1.0 / (daily_vol_target ** 2) if daily_vol_target > 0 else 1000
-            
-            # Standard mean-variance objective: maximize return - (risk_aversion/2) * variance
-            return -(portfolio_return - (risk_aversion / 2) * portfolio_variance)
+            # FIX: Use ANNUALIZED vol target since cov_matrix is ANNUALIZED (line 910)
+            # Previously used daily_vol_target which made risk_aversion ~250x too high!
+            # annualized_vol_target is pre-computed at function start
+            risk_aversion = 1.0 / (annualized_vol_target ** 2) if annualized_vol_target > 0 else 1000
+
+            # Add costs for long/short positions
+            total_cost = 0.0
+            if enable_long_short and daily_costs:
+                # Leverage cost on gross exposure above 1.0
+                gross_exposure = np.sum(np.abs(weights))
+                if gross_exposure > 1.0:
+                    leverage_amount = gross_exposure - 1.0
+                    total_cost += leverage_amount * daily_costs['leverage_cost_daily'] / 10000
+
+                # Short borrowing cost
+                short_weights = np.minimum(weights, 0)
+                short_exposure = np.abs(np.sum(short_weights))
+                total_cost += short_exposure * daily_costs['borrow_cost_daily'] / 10000
+
+                # Short rebate (typically minimal or zero)
+                total_cost -= short_exposure * daily_costs['short_rebate_daily'] / 10000
+
+            # FIX 3A: Transaction cost penalty based on turnover from previous weights
+            tc_penalty = 0.0
+            if config.TC_INCLUDE_IN_OPTIMIZER and previous_weights is not None:
+                # Calculate turnover (one-way)
+                turnover = np.sum(np.abs(weights - previous_weights.values))
+                # Convert TC from basis points to decimal and apply to turnover
+                tc_penalty = (config.TC_BPS_PER_TRADE / 10000) * turnover
+
+            # Standard mean-variance objective: maximize return - costs - TC - (risk_aversion/2) * variance
+            return -(portfolio_return - total_cost - tc_penalty - (risk_aversion / 2) * portfolio_variance)
         
         # Define constraints
         constraints = []
         constraint_status = {}
-        
-        # 1. Budget constraint: weights sum to 1
-        constraints.append({
-            'type': 'eq',
-            'fun': lambda w: np.sum(w) - 1.0
-        })
-        constraint_status['budget'] = True
-        
-        # 2. SIMPLIFIED: Only add risk constraint if really needed
-        # Remove risk constraint for faster convergence in most cases
-        if daily_vol_target < 0.01:  # Only for very low vol targets
-            def risk_constraint(weights):
-                portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
-                return (daily_vol_target * 1.2)**2 - portfolio_var
-            
+
+        # 1. Net exposure constraint: weights sum to net target
+        if enable_long_short:
+            # Long/short: net exposure equals target (e.g., 1.0 for 100% long bias)
+            def net_exposure_constraint(w):
+                return np.sum(w) - ls_config.NET_EXPOSURE_TARGET
+
             constraints.append({
-                'type': 'ineq', 
-                'fun': risk_constraint
+                'type': 'eq',
+                'fun': net_exposure_constraint
             })
-            constraint_status['risk'] = True
+            constraint_status['net_exposure'] = True
         else:
-            constraint_status['risk'] = False
+            # Long-only: traditional budget constraint (weights sum to 1)
+            constraints.append({
+                'type': 'eq',
+                'fun': lambda w: np.sum(w) - 1.0
+            })
+            constraint_status['budget'] = True
+
+        # 1b. Gross exposure constraint (long/short only)
+        if enable_long_short:
+            def gross_exposure_constraint(w):
+                """Gross exposure = sum of absolute weights must be <= limit"""
+                return ls_config.GROSS_EXPOSURE_LIMIT - np.sum(np.abs(w))
+
+            constraints.append({
+                'type': 'ineq',
+                'fun': gross_exposure_constraint
+            })
+            constraint_status['gross_exposure'] = True
+            print(f"   📊 Added gross exposure constraint: <= {ls_config.GROSS_EXPOSURE_LIMIT:.0%}")
+        else:
+            constraint_status['gross_exposure'] = False
+
+        # 2. VOLATILITY BAND CONSTRAINT
+        # FIX: Add BOTH upper AND lower bounds to target volatility within a band
+        # Without lower bound, optimizer chooses very conservative portfolios with low vol
+        # Note: annualized_vol_target is pre-computed at function start
         
-        # 3. ⭐ CRITICAL: STRESS TEST CONSTRAINT - Previously missing! ⭐
-        if use_stress_test and portfolio.stress_test_values is not None:
+        # Upper bound: prevent volatility from exceeding target + 20%
+        def risk_upper_constraint(weights):
+            portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
+            # Constraint: portfolio_var <= (target * 1.2)^2
+            return (annualized_vol_target * 1.2)**2 - portfolio_var
+
+        constraints.append({
+            'type': 'ineq',
+            'fun': risk_upper_constraint
+        })
+        
+        # Lower bound: prevent volatility from being too far below target
+        # Allow 40% below target to give optimizer some flexibility
+        def risk_lower_constraint(weights):
+            portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
+            # Constraint: portfolio_var >= (target * 0.6)^2
+            return portfolio_var - (annualized_vol_target * 0.6)**2
+
+        constraints.append({
+            'type': 'ineq',
+            'fun': risk_lower_constraint
+        })
+        constraint_status['risk'] = True
+        print(f"   📊 Added volatility band constraint: {annualized_vol_target*0.6:.1%} to {annualized_vol_target*1.2:.1%}")
+        
+        # 3. ⭐ CRITICAL: STRESS TEST CONSTRAINT ⭐
+        # FIX 1A: Calculate PIT stress values if enabled
+        stress_values_to_use = None
+        if use_stress_test:
+            if getattr(portfolio, 'use_pit_stress', False) or portfolio.stress_test_values is None:
+                # Calculate Point-in-Time stress values using only historical data
+                stress_values_to_use = _calculate_pit_stress_values(portfolio, end_date)
+                print(f"   🔒 Using PIT stress values (max drawdown): {stress_values_to_use.min():.2f}% to {stress_values_to_use.max():.2f}%")
+            else:
+                # Use static stress values (legacy mode with potential look-ahead bias)
+                stress_values_to_use = portfolio.stress_test_values
+
+        if use_stress_test and stress_values_to_use is not None:
             def stress_test_constraint(weights):
                 """Portfolio stress loss must be > -15% (loss less than 15%)"""
-                portfolio_stress_loss = np.dot(weights, portfolio.stress_test_values.values)
+                if enable_long_short:
+                    # For long/short: stress test on gross positions
+                    # Apply stress to long positions, inverse to short positions
+                    long_weights = np.maximum(weights, 0)
+                    short_weights = np.minimum(weights, 0)
+
+                    # Long positions lose value, short positions gain (negative of stress)
+                    portfolio_stress_loss = (
+                        np.dot(long_weights, stress_values_to_use.values) -
+                        np.dot(np.abs(short_weights), stress_values_to_use.values)
+                    )
+                else:
+                    # Traditional long-only stress test (FIX 1A: uses PIT values when enabled)
+                    portfolio_stress_loss = np.dot(weights, stress_values_to_use.values)
+
                 return portfolio_stress_loss + config.STRESS_TEST_MAX_LOSS
-            
+
             constraints.append({
                 'type': 'ineq',
                 'fun': stress_test_constraint
@@ -785,8 +1156,14 @@ def _optimize_single_date(portfolio: Portfolio,
         else:
             constraint_status['duration'] = False
         
-        # Weight bounds: 0 to MAX_WEIGHT_PER_ASSET
-        bounds = [(0.0, config.MAX_WEIGHT_PER_ASSET) for _ in range(n_assets)]
+        # Weight bounds: Long-only or Long/Short
+        if enable_long_short:
+            # Allow short positions
+            bounds = [(ls_config.MAX_SHORT_WEIGHT, ls_config.MAX_LONG_WEIGHT) for _ in range(n_assets)]
+            print(f"   📊 Weight bounds: [{ls_config.MAX_SHORT_WEIGHT:.0%}, {ls_config.MAX_LONG_WEIGHT:.0%}]")
+        else:
+            # Traditional long-only
+            bounds = [(0.0, config.MAX_WEIGHT_PER_ASSET) for _ in range(n_assets)]
         
         # IMPROVED: Even better initial guess
         try:
@@ -836,44 +1213,85 @@ def _optimize_single_date(portfolio: Portfolio,
                 }
             )
             
-            # If SLSQP fails, try L-BFGS-B without constraints (for debugging)
-            if not result.success and len(constraints) > 1:
-                print(f"   🔄 SLSQP failed, trying simpler approach...")
-                # Just budget constraint
-                simple_constraints = [constraints[0]]  # Only budget constraint
-                
-                result = optimize.minimize(
-                    objective,
-                    initial_weights,
-                    method='SLSQP',
-                    bounds=bounds,
-                    constraints=simple_constraints,
-                    options={
-                        'maxiter': 1000,
-                        'ftol': 1e-3
-                    }
+            # FIX 1B + 3B: No silent constraint dropping + strict status check
+            # Use both result.success flag AND result.status == 0 for robustness
+            optimization_failed = not result.success or result.status != 0
+            if optimization_failed:
+                print(f"   ❌ Optimization failed: {result.message}")
+
+                # Diagnose what constraints were violated (FIX 1A: uses PIT stress values)
+                # FIX: Pass annualized vol target since cov_matrix is annualized
+                violations = _diagnose_constraint_violations(
+                    result.x, cov_matrix, annualized_vol_target,
+                    stress_values_to_use, use_stress_test, enable_long_short
                 )
-                
-                # Update constraint status
-                constraint_status['risk'] = False
-                constraint_status['stress_test'] = False
-                constraint_status['duration'] = False
-                
+                if violations:
+                    print(f"   📋 Constraint violations: {violations}")
+
+                # FAILURE PROTOCOL: Use previous weights or equal weights
+                if previous_weights is not None:
+                    print(f"   ⚠️ Using previous period weights due to optimization failure")
+                    fallback_weights = previous_weights
+                    fallback_type = 'previous_weights'
+                else:
+                    print(f"   ⚠️ No previous weights available, using equal weights")
+                    fallback_weights = pd.Series(1.0 / n_assets, index=portfolio.etf_order)
+                    fallback_type = 'equal_weights'
+
+                # Calculate metrics for fallback weights
+                fallback_return = np.dot(fallback_weights.values, expected_returns.values)
+                fallback_var = np.dot(fallback_weights.values, np.dot(cov_matrix.values, fallback_weights.values))
+                fallback_vol = np.sqrt(fallback_var)
+
+                return {
+                    'success': True,  # True because we have valid weights (fallback)
+                    'weights': fallback_weights,
+                    'expected_return': fallback_return,
+                    'volatility': fallback_vol,
+                    'sharpe_ratio': fallback_return / fallback_vol if fallback_vol > 0 else 0,
+                    'covariance_matrix': cov_matrix,
+                    'constraints_satisfied': constraint_status,
+                    'fallback_used': fallback_type,
+                    'original_failure': result.message,
+                    'constraint_violations': violations
+                }
+
         except Exception as e:
             return {'success': False, 'error': f'Optimization setup error: {str(e)}'}
-        
-        if result.success:
+
+        # FIX 3B: Strict success check - must have status=0 AND success flag
+        if result.success and result.status == 0:
             weights = pd.Series(result.x, index=portfolio.etf_order)
             expected_return = np.dot(weights.values, expected_returns.values)
             portfolio_var = np.dot(weights.values, np.dot(cov_matrix.values, weights.values))
             portfolio_vol = np.sqrt(portfolio_var)
-            
-            # Calculate stress test result if applicable
+
+            # DIAGNOSTIC: Sharpe ratio component analysis
+            sharpe_ratio_calc = expected_return / portfolio_vol if portfolio_vol > 0 else 0
+            print(f"   📊 SHARPE DIAGNOSTIC for {end_date.strftime('%Y-%m-%d')}:")
+            print(f"      Expected Return (annual): {expected_return:.6f} ({expected_return*100:.4f}%)")
+            print(f"      Portfolio Vol (annual):   {portfolio_vol:.6f} ({portfolio_vol*100:.4f}%)")
+            print(f"      Sharpe Ratio:             {sharpe_ratio_calc:.4f}")
+            print(f"      Input expected_returns range: {expected_returns.min():.6f} to {expected_returns.max():.6f}")
+            print(f"      Cov matrix diagonal (ann vol^2): {np.diag(cov_matrix.values).min():.8f} to {np.diag(cov_matrix.values).max():.8f}")
+            print(f"      Implied asset vols (annual): {np.sqrt(np.diag(cov_matrix.values)).min():.4f} to {np.sqrt(np.diag(cov_matrix.values)).max():.4f}")
+
+            # Calculate stress test result if applicable (FIX 1A: uses PIT values when enabled)
             stress_test_result = None
-            if use_stress_test and portfolio.stress_test_values is not None:
-                stress_test_result = np.dot(weights.values, portfolio.stress_test_values.values)
-            
-            return {
+            if use_stress_test and stress_values_to_use is not None:
+                if enable_long_short:
+                    # Long/short stress test
+                    long_weights = np.maximum(weights.values, 0)
+                    short_weights = np.minimum(weights.values, 0)
+                    stress_test_result = (
+                        np.dot(long_weights, stress_values_to_use.values) -
+                        np.dot(np.abs(short_weights), stress_values_to_use.values)
+                    )
+                else:
+                    stress_test_result = np.dot(weights.values, stress_values_to_use.values)
+
+            # Calculate long/short specific metrics
+            result_dict = {
                 'success': True,
                 'weights': weights,
                 'expected_return': expected_return,
@@ -884,6 +1302,23 @@ def _optimize_single_date(portfolio: Portfolio,
                 'constraints_satisfied': constraint_status,
                 'optimization_result': result
             }
+
+            if enable_long_short:
+                gross_exposure = weights.abs().sum()
+                net_exposure = weights.sum()
+                long_exposure = weights[weights > 0].sum()
+                short_exposure = weights[weights < 0].sum()
+                leverage_ratio = gross_exposure / abs(net_exposure) if net_exposure != 0 else 0
+
+                result_dict.update({
+                    'gross_exposure': gross_exposure,
+                    'net_exposure': net_exposure,
+                    'long_exposure': long_exposure,
+                    'short_exposure': short_exposure,
+                    'leverage_ratio': leverage_ratio
+                })
+
+            return result_dict
         else:
             return {
                 'success': False, 
@@ -893,6 +1328,76 @@ def _optimize_single_date(portfolio: Portfolio,
             
     except Exception as e:
         return {'success': False, 'error': f'Optimization error: {str(e)}'}
+
+
+def _diagnose_constraint_violations(weights: np.ndarray,
+                                    cov_matrix: pd.DataFrame,
+                                    vol_target: float,
+                                    stress_values: Optional[pd.Series],
+                                    use_stress_test: bool,
+                                    enable_long_short: bool = False) -> Dict[str, str]:
+    """
+    FIX 1B: Diagnose specific constraint violations for logging.
+
+    Returns dict mapping constraint name to violation description.
+    """
+    violations = {}
+
+    # Budget constraint (should sum to 1.0 for long-only, or net exposure for L/S)
+    weight_sum = np.sum(weights)
+    if not enable_long_short:
+        budget_deviation = abs(weight_sum - 1.0)
+        if budget_deviation > 1e-4:
+            violations['budget'] = f"Sum = {weight_sum:.4f}, deviation = {budget_deviation:.4f}"
+    else:
+        # For long/short, check net exposure bounds
+        if abs(weight_sum - 1.0) > 0.15:  # ±15% tolerance on net exposure
+            violations['net_exposure'] = f"Net exposure = {weight_sum:.4f}"
+
+    # Volatility check
+    try:
+        portfolio_var = np.dot(weights, np.dot(cov_matrix.values, weights))
+        portfolio_vol = np.sqrt(portfolio_var)
+        if portfolio_vol > vol_target * 1.5:  # 50% above target
+            violations['volatility'] = f"Vol = {portfolio_vol:.4f}, target = {vol_target:.4f}"
+    except Exception:
+        violations['volatility'] = "Could not compute portfolio volatility"
+
+    # Stress test constraint
+    if use_stress_test and stress_values is not None:
+        try:
+            if enable_long_short:
+                long_w = np.maximum(weights, 0)
+                short_w = np.minimum(weights, 0)
+                stress_loss = (
+                    np.dot(long_w, stress_values.values) -
+                    np.dot(np.abs(short_w), stress_values.values)
+                )
+            else:
+                stress_loss = np.dot(weights, stress_values.values)
+
+            if stress_loss < -config.STRESS_TEST_MAX_LOSS:
+                violations['stress_test'] = f"Loss = {stress_loss:.2f}%, limit = {-config.STRESS_TEST_MAX_LOSS}%"
+        except Exception:
+            violations['stress_test'] = "Could not compute stress test loss"
+
+    # Weight bounds
+    if not enable_long_short:
+        if (weights < -1e-6).any():
+            neg_weights = weights[weights < -1e-6]
+            violations['negative_weights'] = f"{len(neg_weights)} assets have negative weights"
+        if (weights > config.MAX_WEIGHT_PER_ASSET + 1e-6).any():
+            over_weights = weights[weights > config.MAX_WEIGHT_PER_ASSET + 1e-6]
+            violations['max_weight'] = f"{len(over_weights)} assets exceed {config.MAX_WEIGHT_PER_ASSET:.0%} limit"
+    else:
+        # Long/short bounds
+        if (weights > ls_config.MAX_LONG_WEIGHT + 1e-6).any():
+            violations['max_long'] = f"Some weights exceed {ls_config.MAX_LONG_WEIGHT:.0%} long limit"
+        if (weights < ls_config.MAX_SHORT_WEIGHT - 1e-6).any():
+            violations['max_short'] = f"Some weights below {ls_config.MAX_SHORT_WEIGHT:.0%} short limit"
+
+    return violations
+
 
 def _calculate_momentum_ratio(prices: pd.DataFrame, 
                             ma_short: pd.DataFrame, 
@@ -959,19 +1464,25 @@ def calculate_portfolio_performance(optimization_results: Dict[str, Any],
     
     # Calculate risk metrics
     risk_metrics = _calculate_risk_metrics(portfolio_returns, weights_df, portfolio.returns)
-    
+
+    # Calculate long/short metrics if applicable
+    long_short_metrics = None
+    if portfolio.enable_long_short:
+        long_short_metrics = calculate_long_short_metrics(optimization_results)
+
     # Combine all metrics
     full_performance = {
         'portfolio_returns': portfolio_returns,
         'weights': weights_df,
         'performance_metrics': performance_metrics,
         'risk_metrics': risk_metrics,
+        'long_short_metrics': long_short_metrics,
         'optimization_summary': _summarize_optimization_results(optimization_results)
     }
-    
+
     print(f"✅ Performance analysis completed")
-    _print_performance_summary(performance_metrics, risk_metrics)
-    
+    _print_performance_summary(performance_metrics, risk_metrics, long_short_metrics)
+
     return full_performance
 
 def _calculate_portfolio_returns(weights_df: pd.DataFrame, returns_df: pd.DataFrame) -> pd.Series:
@@ -1021,7 +1532,16 @@ def _calculate_performance_metrics(portfolio_returns: pd.Series) -> Dict[str, fl
     annualized_return = mean_return * config.TRADING_DAYS_PER_YEAR
     annualized_volatility = std_return * config.SQRT_TRADING_DAYS
     sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility > 0 else 0
-    
+
+    # DIAGNOSTIC: Performance Sharpe ratio component analysis
+    print(f"   📈 PERFORMANCE SHARPE DIAGNOSTIC:")
+    print(f"      Daily mean return:        {mean_return:.8f} ({mean_return*100:.6f}%)")
+    print(f"      Daily std return:         {std_return:.8f} ({std_return*100:.6f}%)")
+    print(f"      Annualized return:        {annualized_return:.6f} ({annualized_return*100:.4f}%)")
+    print(f"      Annualized volatility:    {annualized_volatility:.6f} ({annualized_volatility*100:.4f}%)")
+    print(f"      Performance Sharpe Ratio: {sharpe_ratio:.4f}")
+    print(f"      Sample returns range:     {adjusted_returns.min():.8f} to {adjusted_returns.max():.8f}")
+
     # Cumulative metrics
     cumulative_returns = (1 + adjusted_returns / 100).cumprod() if adjusted_returns.abs().max() < 10 else (1 + adjusted_returns).cumprod()
     total_return = cumulative_returns.iloc[-1] - 1
@@ -1125,13 +1645,49 @@ def _summarize_optimization_results(optimization_results: Dict[str, Any]) -> Dic
     
     return summary
 
-def _print_performance_summary(performance_metrics: Dict[str, float], 
-                             risk_metrics: Dict[str, Any]):
+def calculate_long_short_metrics(optimization_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate long/short specific metrics from optimization results.
+
+    Args:
+        optimization_results: Results from optimize_portfolio()
+
+    Returns:
+        Dictionary with long/short metrics
+    """
+    results = optimization_results.get('results', [])
+    if not results or not any('gross_exposure' in r for r in results):
+        return {}
+
+    # Extract long/short metrics from results
+    gross_exposures = [r.get('gross_exposure', 0) for r in results if 'gross_exposure' in r]
+    net_exposures = [r.get('net_exposure', 0) for r in results if 'net_exposure' in r]
+    long_exposures = [r.get('long_exposure', 0) for r in results if 'long_exposure' in r]
+    short_exposures = [r.get('short_exposure', 0) for r in results if 'short_exposure' in r]
+    leverage_ratios = [r.get('leverage_ratio', 0) for r in results if 'leverage_ratio' in r]
+
+    if not gross_exposures:
+        return {}
+
+    return {
+        'avg_gross_exposure': np.mean(gross_exposures),
+        'max_gross_exposure': np.max(gross_exposures),
+        'min_gross_exposure': np.min(gross_exposures),
+        'avg_net_exposure': np.mean(net_exposures),
+        'avg_long_exposure': np.mean(long_exposures),
+        'avg_short_exposure': np.mean(short_exposures),
+        'avg_leverage_ratio': np.mean(leverage_ratios),
+        'max_leverage_ratio': np.max(leverage_ratios)
+    }
+
+def _print_performance_summary(performance_metrics: Dict[str, float],
+                             risk_metrics: Dict[str, Any],
+                             long_short_metrics: Dict[str, Any] = None):
     """Print formatted performance summary"""
-    
+
     if not performance_metrics:
         return
-    
+
     print("\n📈 PERFORMANCE SUMMARY")
     print("-" * 40)
     print(f"Annualized Return:     {performance_metrics['annualized_return']:>8.2%}")
@@ -1139,17 +1695,26 @@ def _print_performance_summary(performance_metrics: Dict[str, float],
     print(f"Sharpe Ratio:          {performance_metrics['sharpe_ratio']:>8.2f}")
     print(f"Max Drawdown:          {performance_metrics['max_drawdown']:>8.2%}")
     print(f"Total Return:          {performance_metrics['total_return']:>8.2%}")
-    
+
     if risk_metrics:
         print(f"\n🎯 RISK METRICS")
         print("-" * 40)
         print(f"VaR (95%, Annual):     {risk_metrics.get('var_95_annual', 0):>8.2%}")
         print(f"CVaR (95%, Annual):    {risk_metrics.get('cvar_95_annual', 0):>8.2%}")
-        
+
         conc = risk_metrics.get('concentration_metrics', {})
         if conc:
             print(f"Avg Effective Assets:  {conc.get('avg_effective_assets', 0):>8.1f}")
             print(f"Max Weight:            {conc.get('max_concentration', 0):>8.2%}")
+
+    if long_short_metrics:
+        print(f"\n📊 LONG/SHORT METRICS")
+        print("-" * 40)
+        print(f"Avg Gross Exposure:    {long_short_metrics.get('avg_gross_exposure', 0):>8.2%}")
+        print(f"Avg Net Exposure:      {long_short_metrics.get('avg_net_exposure', 0):>8.2%}")
+        print(f"Avg Long Exposure:     {long_short_metrics.get('avg_long_exposure', 0):>8.2%}")
+        print(f"Avg Short Exposure:    {long_short_metrics.get('avg_short_exposure', 0):>8.2%}")
+        print(f"Avg Leverage Ratio:    {long_short_metrics.get('avg_leverage_ratio', 0):>8.2f}")
 
 def compare_with_benchmark(portfolio_performance: Dict[str, Any], 
                           portfolio: Portfolio) -> Dict[str, Any]:
@@ -1196,25 +1761,27 @@ print("✅ Performance analysis functions ready")
 # SECTION 6: HIGH-LEVEL WORKFLOW MANAGEMENT
 # =============================================================================
 
-def run_portfolio_strategy(strategy_name: str, 
+def run_portfolio_strategy(strategy_name: str,
                           max_windows: Optional[int] = None,
-                          debug_mode: bool = True) -> Dict[str, Any]:
+                          debug_mode: bool = True,
+                          enable_long_short: bool = False) -> Dict[str, Any]:
     """
     Complete workflow: Load data, optimize, analyze performance for a single strategy.
-    
+
     Args:
-        strategy_name: Name of strategy (e.g., "Moderate Int.20121101.current") 
+        strategy_name: Name of strategy (e.g., "Moderate Int.20121101.current")
         max_windows: Maximum number of optimization windows to process (for testing)
         debug_mode: If True, writes outputs to local debug folder
-    
+        enable_long_short: If True, enables long/short positions with leverage
+
     Returns:
         Dictionary with complete results
     """
     print(f"🚀 RUNNING PORTFOLIO STRATEGY: {strategy_name}")
     print("=" * 70)
-    
+
     # Create fresh portfolio instance
-    portfolio_instance = Portfolio(debug_mode=debug_mode)
+    portfolio_instance = Portfolio(debug_mode=debug_mode, enable_long_short=enable_long_short)
     
     try:
         # Step 1: Load all data
@@ -1885,6 +2452,60 @@ def demo_multiple_strategies():
     except Exception as e:
         print(f"\n❌ MULTIPLE STRATEGIES ERROR: {str(e)}")
 
+def demo_long_short_strategy():
+    """
+    Run a long/short strategy demo with leverage.
+    """
+    print("🚀 RUNNING LONG/SHORT STRATEGY DEMO")
+    print("=" * 50)
+    print("This will run optimization with short positions and leverage enabled.")
+    print("Expected runtime: 5-10 minutes")
+    print()
+
+    try:
+        result = run_portfolio_strategy(
+            strategy_name="Moderate Int.20121101.current",
+            max_windows=50,  # Reasonable size for demo
+            debug_mode=True,
+            enable_long_short=True  # Enable long/short mode
+        )
+
+        if result['success']:
+            print("\n🎉 LONG/SHORT STRATEGY DEMO SUCCESSFUL!")
+
+            # Generate and display performance report
+            perf_results = result.get('performance_results', {})
+            if perf_results:
+                print("\n📊 PERFORMANCE REPORT:")
+
+                perf_metrics = perf_results.get('performance_metrics', {})
+                if perf_metrics:
+                    print(f"\n📈 Returns:")
+                    print(f"   Annualized Return: {perf_metrics.get('annualized_return', 0):.2%}")
+                    print(f"   Sharpe Ratio: {perf_metrics.get('sharpe_ratio', 0):.2f}")
+                    print(f"   Max Drawdown: {perf_metrics.get('max_drawdown', 0):.2%}")
+
+                ls_metrics = perf_results.get('long_short_metrics', {})
+                if ls_metrics:
+                    print(f"\n📊 Long/Short Exposure:")
+                    print(f"   Avg Gross Exposure: {ls_metrics.get('avg_gross_exposure', 0):.2%}")
+                    print(f"   Avg Net Exposure: {ls_metrics.get('avg_net_exposure', 0):.2%}")
+                    print(f"   Avg Long Exposure: {ls_metrics.get('avg_long_exposure', 0):.2%}")
+                    print(f"   Avg Short Exposure: {ls_metrics.get('avg_short_exposure', 0):.2%}")
+                    print(f"   Avg Leverage Ratio: {ls_metrics.get('avg_leverage_ratio', 0):.2f}x")
+
+            # Show file outputs
+            export_results = result.get('export_results', {})
+            if export_results:
+                print(f"\n💾 Files created:")
+                for file_type, file_path in export_results.items():
+                    print(f"   {file_type}: {file_path}")
+        else:
+            print(f"\n❌ LONG/SHORT STRATEGY DEMO FAILED: {result.get('error')}")
+
+    except Exception as e:
+        print(f"\n❌ LONG/SHORT STRATEGY DEMO ERROR: {str(e)}")
+
 def show_system_summary():
     """
     Display a summary of the refactored system capabilities.
@@ -1893,15 +2514,15 @@ def show_system_summary():
     print("FOLIO BEYOND FIXED INCOME OPTIMIZATION SYSTEM - REFACTORED")
     print("=" * 70)
     
-    print("\n🎯 KEY IMPROVEMENTS MADE:")
-    print("  ✅ Added missing stress test constraints - Core functionality now complete")
-    print("  ✅ Removed dead code - Eliminated unused parameters and functions") 
-    print("  ✅ Standardized data types - Consistent DataFrame usage throughout")
-    print("  ✅ Clear separation of concerns - Configuration, data, optimization, analysis")
-    print("  ✅ Single entry points - Eliminated redundant functions")
-    print("  ✅ Configuration-driven - All parameters externalized")
-    print("  ✅ Improved error handling - Clear error messages and validation")
-    print("  ✅ Better documentation - Clear function purposes and workflows")
+    print("\n🎯 KEY FEATURES:")
+    print("  ✅ Mean-variance optimization with stress test constraints")
+    print("  ✅ Long-only AND long/short with leverage support")
+    print("  ✅ Multiple volatility targets (Low/Moderate/High/RRS)")
+    print("  ✅ Comprehensive risk analytics (VaR, CVaR, drawdown)")
+    print("  ✅ Standardized data types and clean architecture")
+    print("  ✅ Configuration-driven with all parameters externalized")
+    print("  ✅ Debug mode for safe testing")
+    print("  ✅ Modular design for easy extension")
     
     print("\n🚀 MAIN ENTRY POINTS:")
     print("  • run_quick_test() - Quick testing with limited data")
@@ -1910,18 +2531,23 @@ def show_system_summary():
     
     print("\n🧪 DEMO FUNCTIONS:")
     print("  • demo_quick_test() - 1-2 minute quick verification")
-    print("  • demo_full_strategy() - 5-15 minute full strategy demo") 
+    print("  • demo_full_strategy() - 5-15 minute full long-only strategy")
+    print("  • demo_long_short_strategy() - 5-10 minute long/short with leverage")
     print("  • demo_multiple_strategies() - Compare multiple strategies")
-    
-    print("\n⚙️ CONFIGURATION:")
+
+    print("\n⚙️ CONFIGURATION - LONG-ONLY:")
     print(f"  • Trading days per year: {config.TRADING_DAYS_PER_YEAR}")
     print(f"  • Lookback window: {config.LOOKBACK_WINDOW_DAYS} days")
     print(f"  • Max weight per asset: {config.MAX_WEIGHT_PER_ASSET:.1%}")
     print(f"  • Stress test max loss: {config.STRESS_TEST_MAX_LOSS}%")
-    
-    print("\n🔥 CRITICAL FIX:")
-    print("  Stress test constraints are now properly implemented in optimization!")
-    print("  Portfolio stress loss is constrained to <= 15% as required.")
+
+    print("\n⚙️ CONFIGURATION - LONG/SHORT:")
+    print(f"  • Max long weight: {ls_config.MAX_LONG_WEIGHT:.1%}")
+    print(f"  • Max short weight: {ls_config.MAX_SHORT_WEIGHT:.1%}")
+    print(f"  • Gross exposure limit: {ls_config.GROSS_EXPOSURE_LIMIT:.1%}")
+    print(f"  • Net exposure target: {ls_config.NET_EXPOSURE_TARGET:.1%}")
+    print(f"  • Leverage cost: {ls_config.LEVERAGE_COST_BPS/100:.2%} annual")
+    print(f"  • Borrow cost: {ls_config.BORROW_COST_BPS/100:.2%} annual")
     
     print("\n💾 OUTPUT:")
     print("  • All outputs written to debug folders by default (safe testing)")
@@ -1940,23 +2566,27 @@ if __name__ == "__main__":
     # Create portfolio instance in DEBUG mode by default for safety
     portfolio = Portfolio(debug_mode=True)
     print(f"📊 Portfolio summary: {portfolio.get_data_summary()}")
-    
+
     # Show system summary when file is executed
     show_system_summary()
-    
+
     print("\n🧪 READY TO TEST!")
     print("\nChoose your testing approach:")
-    print("1️⃣ Quick verification:    demo_quick_test()")
-    print("2️⃣ Full single strategy:  demo_full_strategy()")  
-    print("3️⃣ Multiple strategies:   demo_multiple_strategies()")
+    print("1️⃣ Quick verification:           demo_quick_test()")
+    print("2️⃣ Full long-only strategy:     demo_full_strategy()")
+    print("3️⃣ Long/short with leverage:    demo_long_short_strategy()")
+    print("4️⃣ Multiple strategies:          demo_multiple_strategies()")
     print("\nOr use the main functions directly:")
     print("🎯 run_quick_test()")
-    print("🚀 run_portfolio_strategy('Moderate Int.20121101.current')")
-    print("📊 run_multiple_strategies(['strategy1', 'strategy2'])")
-    
-    # Uncomment the line below to run a quick demo automatically:
-    #demo_quick_test()
-    demo_full_strategy()
+    print("🚀 run_portfolio_strategy('Moderate Int.20121101.current', enable_long_short=False)")
+    print("📊 run_portfolio_strategy('Moderate Int.20121101.current', enable_long_short=True)")
+    print("📈 run_multiple_strategies(['strategy1', 'strategy2'])")
+
+    # Uncomment one of the lines below to run a demo automatically:
+    # demo_quick_test()
+    # demo_full_strategy()
+    # demo_long_short_strategy()
+    pass
     
 
 
